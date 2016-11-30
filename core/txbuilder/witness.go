@@ -1,11 +1,11 @@
 package txbuilder
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 
+	"chain/core/pb"
 	"chain/crypto/sha3pool"
-	chainjson "chain/encoding/json"
 	"chain/errors"
 	"chain/protocol/bc"
 	"chain/protocol/vm"
@@ -23,69 +23,61 @@ type SignFunc func(context.Context, string, [][]byte, [32]byte) ([]byte, error)
 type WitnessComponent interface {
 	// Sign is called to add signatures. Actual signing is delegated to
 	// a callback function.
-	Sign(context.Context, *Template, int, []string, SignFunc) error
+	Sign(context.Context, *Template, uint32, []string, SignFunc) error
 
 	// Materialize is called to turn the component into a vector of
 	// arguments for the input witness.
-	Materialize(*Template, int, *[][]byte) error
+	Materialize(*Template, uint32, *[][]byte) error
 }
 
 // materializeWitnesses takes a filled in Template and "materializes"
 // each witness component, turning it into a vector of arguments for
 // the tx's input witness, creating a fully-signed transaction.
 func materializeWitnesses(txTemplate *Template) error {
-	msg := txTemplate.Transaction
-
-	if msg == nil {
+	tx := txTemplate.Tx
+	if tx == nil {
 		return errors.Wrap(ErrMissingRawTx)
 	}
 
-	if len(txTemplate.SigningInstructions) > len(msg.Inputs) {
+	if len(txTemplate.SigningInstructions) > len(tx.Inputs) {
 		return errors.Wrap(ErrBadInstructionCount)
 	}
 
 	for i, sigInst := range txTemplate.SigningInstructions {
-		if msg.Inputs[sigInst.Position] == nil {
+		if tx.Inputs[sigInst.Position] == nil {
 			return errors.WithDetailf(ErrBadTxInputIdx, "signing instruction %d references missing tx input %d", i, sigInst.Position)
 		}
 
 		var witness [][]byte
-		for j, c := range sigInst.WitnessComponents {
+		for j, proto := range sigInst.WitnessComponents {
+			var c WitnessComponent
+			switch proto.Component.(type) {
+			case *pb.TxTemplate_WitnessComponent_Signature:
+				c = (*signatureWitness)(proto.GetSignature())
+			}
+			if c == nil {
+				continue
+			}
 			err := c.Materialize(txTemplate, sigInst.Position, &witness)
 			if err != nil {
 				return errors.WithDetailf(err, "error in witness component %d of input %d", j, i)
 			}
 		}
 
-		msg.Inputs[sigInst.Position].SetArguments(witness)
+		tx.Inputs[sigInst.Position].SetArguments(witness)
 	}
+
+	var buf bytes.Buffer
+	_, err := tx.WriteTo(&buf)
+	if err != nil {
+		return err
+	}
+	txTemplate.TxTemplate.RawTransaction = buf.Bytes()
 
 	return nil
 }
 
-type (
-	SignatureWitness struct {
-		// Quorum is the number of signatures required.
-		Quorum int `json:"quorum"`
-
-		// Keys are the identities of the keys to sign with.
-		Keys []KeyID `json:"keys"`
-
-		// Program is the predicate part of the signature program, whose hash is what gets
-		// signed. If empty, it is computed during Sign from the outputs
-		// and the current input of the transaction.
-		Program chainjson.HexBytes `json:"program"`
-
-		// Sigs are signatures of Program made from each of the Keys
-		// during Sign.
-		Sigs []chainjson.HexBytes `json:"signatures"`
-	}
-
-	KeyID struct {
-		XPub           string               `json:"xpub"`
-		DerivationPath []chainjson.HexBytes `json:"derivation_path"`
-	}
-)
+type signatureWitness pb.TxTemplate_SignatureComponent
 
 var ErrEmptyProgram = errors.New("empty signature program")
 
@@ -99,9 +91,9 @@ var ErrEmptyProgram = errors.New("empty signature program")
 //  - the mintime and maxtime of the transaction (if non-zero)
 //  - the outpoint and (if non-empty) reference data of the current input
 //  - the assetID, amount, control program, and (if non-empty) reference data of each output.
-func (sw *SignatureWitness) Sign(ctx context.Context, tpl *Template, index int, xpubs []string, signFn SignFunc) error {
+func (sw *signatureWitness) Sign(ctx context.Context, tpl *Template, index uint32, xpubs []string, signFn SignFunc) error {
 	// Compute the predicate to sign. This is either a
-	// txsighash program if tpl.AllowAdditional is false (i.e., the tx is complete
+	// txsighash program if tpl.AllowAdditionalActions is false (i.e., the tx is complete
 	// and no further changes are allowed) or a program enforcing
 	// constraints derived from the existing outputs and current input.
 	if len(sw.Program) == 0 {
@@ -110,33 +102,33 @@ func (sw *SignatureWitness) Sign(ctx context.Context, tpl *Template, index int, 
 			return ErrEmptyProgram
 		}
 	}
-	if len(sw.Sigs) < len(sw.Keys) {
-		// Each key in sw.Keys may produce a signature in sw.Sigs. Make
+	if len(sw.Signatures) < len(sw.KeyIds) {
+		// Each key in sw.KeyIds may produce a signature in sw.Signaturess. Make
 		// sure there are enough slots in sw.Sigs and that we preserve any
 		// sigs already present.
-		newSigs := make([]chainjson.HexBytes, len(sw.Keys))
-		copy(newSigs, sw.Sigs)
-		sw.Sigs = newSigs
+		newSigs := make([][]byte, len(sw.KeyIds))
+		copy(newSigs, sw.Signatures)
+		sw.Signatures = newSigs
 	}
 	var h [32]byte
 	sha3pool.Sum256(h[:], sw.Program)
-	for i, keyID := range sw.Keys {
-		if len(sw.Sigs[i]) > 0 {
+	for i, keyID := range sw.KeyIds {
+		if len(sw.Signatures[i]) > 0 {
 			// Already have a signature for this key
 			continue
 		}
-		if !contains(xpubs, keyID.XPub) {
+		if !contains(xpubs, keyID.Xpub) {
 			continue
 		}
 		var path [][]byte
 		for _, p := range keyID.DerivationPath {
 			path = append(path, p)
 		}
-		sigBytes, err := signFn(ctx, keyID.XPub, path, h)
+		sigBytes, err := signFn(ctx, keyID.Xpub, path, h)
 		if err != nil {
 			return errors.WithDetailf(err, "computing signature %d", i)
 		}
-		sw.Sigs[i] = sigBytes
+		sw.Signatures[i] = sigBytes
 	}
 	return nil
 }
@@ -150,20 +142,20 @@ func contains(list []string, key string) bool {
 	return false
 }
 
-func buildSigProgram(tpl *Template, index int) []byte {
-	if !tpl.AllowAdditional {
+func buildSigProgram(tpl *Template, index uint32) []byte {
+	if !tpl.AllowAdditionalActions {
 		h := tpl.Hash(index)
 		builder := vmutil.NewBuilder()
 		builder.AddData(h[:])
 		builder.AddOp(vm.OP_TXSIGHASH).AddOp(vm.OP_EQUAL)
 		return builder.Program
 	}
-	constraints := make([]constraint, 0, 3+len(tpl.Transaction.Outputs))
+	constraints := make([]constraint, 0, 3+len(tpl.Tx.Outputs))
 	constraints = append(constraints, &timeConstraint{
-		minTimeMS: tpl.Transaction.MinTime,
-		maxTimeMS: tpl.Transaction.MaxTime,
+		minTimeMS: tpl.Tx.MinTime,
+		maxTimeMS: tpl.Tx.MaxTime,
 	})
-	inp := tpl.Transaction.Inputs[index]
+	inp := tpl.Tx.Inputs[index]
 	if !inp.IsIssuance() {
 		constraints = append(constraints, outpointConstraint(inp.Outpoint()))
 	}
@@ -173,12 +165,12 @@ func buildSigProgram(tpl *Template, index int) []byte {
 	// unconditional. Rationale: no one should be able to change "my"
 	// reference data; anyone should be able to set tx refdata but, once
 	// set, it should be immutable.
-	if len(tpl.Transaction.ReferenceData) > 0 {
-		constraints = append(constraints, refdataConstraint{tpl.Transaction.ReferenceData, true})
+	if len(tpl.Tx.ReferenceData) > 0 {
+		constraints = append(constraints, refdataConstraint{tpl.Tx.ReferenceData, true})
 	}
 	constraints = append(constraints, refdataConstraint{inp.ReferenceData, false})
 
-	for i, out := range tpl.Transaction.Outputs {
+	for i, out := range tpl.Tx.Outputs {
 		c := &payConstraint{
 			Index:       i,
 			AssetAmount: out.AssetAmount,
@@ -201,7 +193,7 @@ func buildSigProgram(tpl *Template, index int) []byte {
 	return program
 }
 
-func (sw SignatureWitness) Materialize(tpl *Template, index int, args *[][]byte) error {
+func (sw *signatureWitness) Materialize(tpl *Template, index uint32, args *[][]byte) error {
 	// This is the value of N for the CHECKPREDICATE call. The code
 	// assumes that everything already in the arg list before this call
 	// to Materialize is input to the signature program, so N is
@@ -209,35 +201,12 @@ func (sw SignatureWitness) Materialize(tpl *Template, index int, args *[][]byte)
 	*args = append(*args, vm.Int64Bytes(int64(len(*args))))
 
 	var nsigs int
-	for i := 0; i < len(sw.Sigs) && nsigs < sw.Quorum; i++ {
-		if len(sw.Sigs[i]) > 0 {
-			*args = append(*args, sw.Sigs[i])
+	for i := 0; i < len(sw.Signatures) && nsigs < int(sw.Quorum); i++ {
+		if len(sw.Signatures[i]) > 0 {
+			*args = append(*args, sw.Signatures[i])
 			nsigs++
 		}
 	}
 	*args = append(*args, sw.Program)
 	return nil
-}
-
-func (sw SignatureWitness) MarshalJSON() ([]byte, error) {
-	obj := struct {
-		Type   string               `json:"type"`
-		Quorum int                  `json:"quorum"`
-		Keys   []KeyID              `json:"keys"`
-		Sigs   []chainjson.HexBytes `json:"signatures"`
-	}{
-		Type:   "signature",
-		Quorum: sw.Quorum,
-		Keys:   sw.Keys,
-		Sigs:   sw.Sigs,
-	}
-	return json.Marshal(obj)
-}
-
-func (si *SigningInstruction) AddWitnessKeys(keys []KeyID, quorum int) {
-	sw := &SignatureWitness{
-		Quorum: quorum,
-		Keys:   keys,
-	}
-	si.WitnessComponents = append(si.WitnessComponents, sw)
 }

@@ -8,13 +8,19 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/metadata"
+
 	"chain/core/accesstoken"
 	"chain/errors"
 )
 
 var errNotAuthenticated = errors.New("not authenticated")
 
-const tokenExpiry = time.Minute * 5
+const (
+	tokenExpiry = time.Minute * 5
+	userKey     = iota
+	pwKey
+)
 
 type apiAuthn struct {
 	tokens *accesstoken.CredentialStore
@@ -55,6 +61,24 @@ func (a *apiAuthn) auth(req *http.Request) error {
 	return a.cachedAuthCheck(req.Context(), typ, user, pw)
 }
 
+func (a *apiAuthn) authRPC(ctx context.Context) (context.Context, error) {
+	md, ok := metadata.FromContext(ctx)
+	if !ok {
+		return ctx, errNotAuthenticated
+	}
+
+	var user, pw string
+	if len(md["username"]) > 0 && len(md["password"]) > 0 {
+		user = md["username"][0]
+		pw = md["password"][0]
+	}
+
+	ctx = context.WithValue(ctx, userKey, user)
+	ctx = context.WithValue(ctx, pwKey, pw)
+
+	return ctx, a.cachedAuthCheck(ctx, "network", user, pw)
+}
+
 func (a *apiAuthn) authCheck(ctx context.Context, typ, user, pw string) (bool, error) {
 	pwBytes, err := hex.DecodeString(pw)
 	if err != nil {
@@ -81,4 +105,8 @@ func (a *apiAuthn) cachedAuthCheck(ctx context.Context, typ, user, pw string) er
 		return errNotAuthenticated
 	}
 	return nil
+}
+
+func userPwFromContext(ctx context.Context) (user string, pw string) {
+	return ctx.Value(userKey).(string), ctx.Value(pwKey).(string)
 }

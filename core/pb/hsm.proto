@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package pb;
+
+import "common.proto";
+import "app.proto";
+
+service HSM {
+	rpc CreateKey(CreateKeyRequest) returns (CreateKeyResponse) {}
+	rpc ListKeys(ListKeysQuery) returns (ListKeysResponse) {}
+	rpc DeleteKey(DeleteKeyRequest) returns (ErrorResponse) {}
+	rpc SignTxs(SignTxsRequest) returns (TxsResponse) {}
+}
+
+message XPub {
+	string alias = 1;
+	bytes xpub = 2;
+}
+
+message CreateKeyRequest {
+	string alias = 1;
+}
+
+message CreateKeyResponse {
+	XPub xpub = 1;
+	Error error = 9;
+}
+
+message ListKeysQuery {
+	repeated string aliases = 1;
+	string after = 2;
+}
+
+message ListKeysResponse {
+	repeated XPub items = 1;
+	bool last_page = 2;
+	ListKeysQuery next = 3;
+	Error error = 9;
+}
+
+message DeleteKeyRequest {
+	bytes xpub = 1;
+}
+
+message SignTxsRequest{
+	repeated TxTemplate transactions = 1;
+	repeated string xpubs = 2;
+}

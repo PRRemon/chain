@@ -2,10 +2,11 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 
+	"chain/core/pb"
 	"chain/core/signers"
-	"chain/encoding/json"
 	"chain/net/http/reqid"
 )
 
@@ -28,20 +29,8 @@ type assetKey struct {
 }
 
 // POST /create-asset
-func (h *Handler) createAsset(ctx context.Context, ins []struct {
-	Alias      string
-	RootXPubs  []string `json:"root_xpubs"`
-	Quorum     int
-	Definition map[string]interface{}
-	Tags       map[string]interface{}
-
-	// ClientToken is the application's unique token for the asset. Every asset
-	// should have a unique client token. The client token is used to ensure
-	// idempotency of create asset requests. Duplicate create asset requests
-	// with the same client_token will only create one asset.
-	ClientToken *string `json:"client_token"`
-}) ([]interface{}, error) {
-	responses := make([]interface{}, len(ins))
+func (h *Handler) CreateAssets(ctx context.Context, in *pb.CreateAssetsRequest) (*pb.CreateAssetsResponse, error) {
+	responses := make([]*pb.CreateAssetsResponse_Response, len(in.Requests))
 	var wg sync.WaitGroup
 	wg.Add(len(responses))
 
@@ -49,44 +38,71 @@ func (h *Handler) createAsset(ctx context.Context, ins []struct {
 		go func(i int) {
 			subctx := reqid.NewSubContext(ctx, reqid.New())
 			defer wg.Done()
-			defer batchRecover(subctx, &responses[i])
+			defer batchRecover(func(err error) {
+				detailedErr, _ := errInfo(err)
+				responses[i] = &pb.CreateAssetsResponse_Response{
+					Error: protobufErr(detailedErr),
+				}
+			})
+
+			var tags, def map[string]interface{}
+			err := json.Unmarshal(in.Requests[i].Tags, &tags)
+			if err != nil {
+				detailedErr, _ := errInfo(err)
+				responses[i] = &pb.CreateAssetsResponse_Response{
+					Error: protobufErr(detailedErr),
+				}
+				return
+			}
+			err = json.Unmarshal(in.Requests[i].Definition, &def)
+			if err != nil {
+				detailedErr, _ := errInfo(err)
+				responses[i] = &pb.CreateAssetsResponse_Response{
+					Error: protobufErr(detailedErr),
+				}
+				return
+			}
 
 			asset, err := h.Assets.Define(
 				subctx,
-				ins[i].RootXPubs,
-				ins[i].Quorum,
-				ins[i].Definition,
-				ins[i].Alias,
-				ins[i].Tags,
-				ins[i].ClientToken,
+				in.Requests[i].RootXpubs,
+				int(in.Requests[i].Quorum),
+				def,
+				in.Requests[i].Alias,
+				tags,
+				in.Requests[i].ClientToken,
 			)
 			if err != nil {
-				responses[i] = err
+				detailedErr, _ := errInfo(err)
+				responses[i] = &pb.CreateAssetsResponse_Response{
+					Error: protobufErr(detailedErr),
+				}
 				return
 			}
-			var keys []assetKey
+			var keys []*pb.Asset_Key
 			for _, xpub := range asset.Signer.XPubs {
 				path := signers.Path(asset.Signer, signers.AssetKeySpace)
 				derived := xpub.Derive(path)
-				keys = append(keys, assetKey{
-					AssetPubkey:         json.HexBytes(derived[:]),
-					RootXPub:            xpub,
+				keys = append(keys, &pb.Asset_Key{
+					AssetPubkey:         derived[:],
+					RootXpub:            xpub[:],
 					AssetDerivationPath: path,
 				})
 			}
-			responses[i] = &assetResponse{
-				ID:              asset.AssetID,
-				Alias:           asset.Alias,
-				IssuanceProgram: asset.IssuanceProgram,
-				Keys:            keys,
-				Quorum:          asset.Signer.Quorum,
-				Definition:      asset.Definition,
-				Tags:            asset.Tags,
-				IsLocal:         "yes",
+			responses[i] = &pb.CreateAssetsResponse_Response{
+				Asset: &pb.Asset{
+					Id:              asset.AssetID.String(),
+					IssuanceProgram: asset.IssuanceProgram,
+					Keys:            keys,
+					Quorum:          int32(asset.Signer.Quorum),
+					Definition:      in.Requests[i].Definition,
+					Tags:            in.Requests[i].Tags,
+					IsLocal:         true,
+				},
 			}
 		}(i)
 	}
 
 	wg.Wait()
-	return responses, nil
+	return &pb.CreateAssetsResponse{Responses: responses}, nil
 }

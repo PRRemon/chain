@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"expvar"
 	"net/http"
 	"strings"
@@ -11,15 +10,17 @@ import (
 	"chain/core/config"
 	"chain/core/fetch"
 	"chain/core/leader"
+	"chain/core/pb"
 	"chain/errors"
 	"chain/log"
-	"chain/net/http/httpjson"
+	"chain/protocol/bc"
 )
 
 var (
 	errAlreadyConfigured = errors.New("core is already configured; must reset first")
 	errUnconfigured      = errors.New("core is not configured")
-	errBadBlockPub       = errors.New("supplied block pub key is invalid")
+	errBadIssuanceWindow = errors.New("supplied issuance window is invalid")
+	errBadBlockchainID   = errors.New("supplied blockchain ID is invalid")
 	errNoClientTokens    = errors.New("cannot enable client auth without client access tokens")
 	// errProdReset is returned when reset is called on a
 	// production system.
@@ -36,50 +37,51 @@ func isProduction() bool {
 	return p != nil && p.String() == `"yes"`
 }
 
-func (h *Handler) reset(ctx context.Context, req struct {
-	Everything bool `json:"everything"`
-}) error {
+func (h *Handler) Reset(ctx context.Context, in *pb.ResetRequest) (*pb.ErrorResponse, error) {
 	if isProduction() {
-		return errors.Wrap(errProdReset)
+		return nil, errors.Wrap(errProdReset)
 	}
 
 	dataToReset := "blockchain"
-	if req.Everything {
+	if in.Everything {
 		dataToReset = "everything"
 	}
 
-	closeConnOK(httpjson.ResponseWriter(ctx), httpjson.Request(ctx))
+	// TODO(@erykwalder): replace on GRPC
+	// closeConnOK(httpjson.ResponseWriter(ctx), httpjson.Request(ctx))
 	execSelf(dataToReset)
 	panic("unreached")
 }
 
-func (h *Handler) info(ctx context.Context) (map[string]interface{}, error) {
+func (h *Handler) Info(ctx context.Context, in *pb.Empty) (*pb.InfoResponse, error) {
 	if h.Config == nil {
 		// never configured
-		return map[string]interface{}{
-			"is_configured": false,
-		}, nil
+		return &pb.InfoResponse{IsConfigured: false}, nil
 	}
 	if leader.IsLeading() {
 		return h.leaderInfo(ctx)
-	} else {
-		var resp map[string]interface{}
-		err := h.forwardToLeader(ctx, "/info", nil, &resp)
-		return resp, err
 	}
+
+	conn, err := leaderConn(ctx, h.DB, h.Addr)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	return pb.NewAppClient(conn).Info(ctx, nil)
 }
 
-func (h *Handler) leaderInfo(ctx context.Context) (map[string]interface{}, error) {
+func (h *Handler) leaderInfo(ctx context.Context) (*pb.InfoResponse, error) {
 	var (
-		generatorHeight  *uint64
-		generatorFetched *time.Time
+		generatorHeight  uint64
+		generatorFetched time.Time
 		snapshot         = fetch.SnapshotProgress()
 		localHeight      = h.Chain.Height()
 	)
 	if h.Config.IsGenerator {
 		now := time.Now()
-		generatorHeight = &localHeight
-		generatorFetched = &now
+		generatorHeight = localHeight
+		generatorFetched = now
 	} else {
 		fetchHeight, fetchTime := fetch.GeneratorHeight()
 		// Because everything is asynchronous, it's possible for the localHeight to
@@ -93,62 +95,95 @@ func (h *Handler) leaderInfo(ctx context.Context) (map[string]interface{}, error
 		// to the remote generator. Only set the height & time if we have it.
 		// The dashboard will handle nulls correctly.
 		if !fetchTime.IsZero() {
-			generatorHeight, generatorFetched = &fetchHeight, &fetchTime
+			generatorHeight, generatorFetched = fetchHeight, fetchTime
 		}
 	}
 
-	version := json.RawMessage(expvar.Get("version").String())
-	buildCommit := json.RawMessage(expvar.Get("buildcommit").String())
-	buildDate := json.RawMessage(expvar.Get("builddate").String())
+	m := &pb.InfoResponse{
+		IsConfigured:                  true,
+		ConfiguredAt:                  h.Config.ConfiguredAt.String(),
+		IsSigner:                      h.Config.IsSigner,
+		IsGenerator:                   h.Config.IsGenerator,
+		GeneratorUrl:                  h.Config.GeneratorURL,
+		GeneratorAccessToken:          obfuscateTokenSecret(h.Config.GeneratorAccessToken),
+		BlockchainId:                  h.Config.BlockchainID[:],
+		BlockHeight:                   localHeight,
+		GeneratorBlockHeight:          generatorHeight,
+		GeneratorBlockHeightFetchedAt: generatorFetched.String(),
+		IsProduction:                  isProduction(),
+		NetworkRpcVersion:             networkRPCVersion,
+		CoreId:                        h.Config.ID,
+		Version:                       config.Version,
+		BuildCommit:                   config.BuildCommit,
+		BuildDate:                     config.BuildDate,
+	}
 
-	m := map[string]interface{}{
-		"is_configured":                     true,
-		"configured_at":                     h.Config.ConfiguredAt,
-		"is_signer":                         h.Config.IsSigner,
-		"is_generator":                      h.Config.IsGenerator,
-		"generator_url":                     h.Config.GeneratorURL,
-		"generator_access_token":            obfuscateTokenSecret(h.Config.GeneratorAccessToken),
-		"blockchain_id":                     h.Config.BlockchainID,
-		"block_height":                      localHeight,
-		"generator_block_height":            generatorHeight,
-		"generator_block_height_fetched_at": generatorFetched,
-		"is_production":                     isProduction(),
-		"network_rpc_version":               networkRPCVersion,
-		"core_id":                           h.Config.ID,
-		"version":                           &version,
-		"build_commit":                      &buildCommit,
-		"build_date":                        &buildDate,
-		"health":                            h.health(),
+	for k, v := range h.health().Errors {
+		if v, ok := v.(string); ok {
+			m.Health[k] = v
+		}
 	}
 
 	// Add in snapshot information if we're downloading a snapshot.
 	if snapshot != nil {
-		m["snapshot"] = map[string]interface{}{
-			"attempt":     snapshot.Attempt,
-			"height":      snapshot.Height,
-			"size":        snapshot.Size,
-			"downloaded":  snapshot.BytesRead(),
-			"in_progress": snapshot.InProgress(),
+		m.Snapshot = &pb.InfoResponse_Snapshot{
+			Attempt:    int32(snapshot.Attempt),
+			Height:     snapshot.Height,
+			Size:       snapshot.Size,
+			Downloaded: snapshot.BytesRead(),
+			InProgress: snapshot.InProgress(),
 		}
 	}
 	return m, nil
 }
 
-func (h *Handler) configure(ctx context.Context, x *config.Config) error {
+func (h *Handler) Configure(ctx context.Context, in *pb.ConfigureRequest) (*pb.ErrorResponse, error) {
+	var err error
+
 	if h.Config != nil {
-		return errAlreadyConfigured
+		return nil, errAlreadyConfigured
 	}
 
-	if x.IsGenerator && x.MaxIssuanceWindow == 0 {
+	x := &config.Config{
+		IsSigner:             in.IsSigner,
+		IsGenerator:          in.IsGenerator,
+		GeneratorURL:         in.GeneratorUrl,
+		GeneratorAccessToken: in.GeneratorAccessToken,
+		BlockPub:             in.BlockPub,
+		Quorum:               int(in.Quorum),
+	}
+
+	for _, u := range in.BlockSignerUrls {
+		x.Signers = append(x.Signers, config.BlockSigner{
+			URL:         u.Url,
+			AccessToken: u.AccessToken,
+			Pubkey:      u.Pubkey,
+		})
+	}
+
+	if in.IsGenerator && in.MaxIssuanceWindow == "" {
 		x.MaxIssuanceWindow = 24 * time.Hour
+	} else if in.IsGenerator {
+		x.MaxIssuanceWindow, err = time.ParseDuration(in.MaxIssuanceWindow)
+		if err != nil {
+			return nil, errors.Wrap(errBadIssuanceWindow, err)
+		}
 	}
 
-	err := config.Configure(ctx, h.DB, x)
+	if in.BlockchainId != nil {
+		if len(in.BlockchainId) != len(bc.Hash{}) {
+			return nil, errBadBlockchainID
+		}
+		copy(x.BlockchainID[:], in.BlockchainId)
+	}
+
+	err = config.Configure(ctx, h.DB, x)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	closeConnOK(httpjson.ResponseWriter(ctx), httpjson.Request(ctx))
+	// TODO(@erykwalder): replace on GRPC
+	// closeConnOK(httpjson.ResponseWriter(ctx), httpjson.Request(ctx))
 	execSelf("")
 	panic("unreached")
 }

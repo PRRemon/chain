@@ -2,8 +2,10 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 
+	"chain/core/pb"
 	"chain/core/signers"
 	"chain/net/http/reqid"
 )
@@ -23,53 +25,65 @@ type accountKey struct {
 	AccountDerivationPath interface{} `json:"account_derivation_path"`
 }
 
-// POST /create-account
-func (h *Handler) createAccount(ctx context.Context, ins []struct {
-	RootXPubs []string `json:"root_xpubs"`
-	Quorum    int
-	Alias     string
-	Tags      map[string]interface{}
-
-	// ClientToken is the application's unique token for the account. Every account
-	// should have a unique client token. The client token is used to ensure
-	// idempotency of create account requests. Duplicate create account requests
-	// with the same client_token will only create one account.
-	ClientToken *string `json:"client_token"`
-}) interface{} {
-	responses := make([]interface{}, len(ins))
+func (h *Handler) CreateAccounts(ctx context.Context, in *pb.CreateAccountsRequest) (*pb.CreateAccountsResponse, error) {
+	responses := make([]*pb.CreateAccountsResponse_Response, len(in.Requests))
 	var wg sync.WaitGroup
-	wg.Add(len(responses))
+	wg.Add(len(in.Requests))
 
-	for i := range responses {
+	for i := range in.Requests {
 		go func(i int) {
+			req := in.Requests[i]
 			subctx := reqid.NewSubContext(ctx, reqid.New())
 			defer wg.Done()
-			defer batchRecover(subctx, &responses[i])
+			defer batchRecover(func(err error) {
+				detailedErr, _ := errInfo(err)
+				responses[i] = &pb.CreateAccountsResponse_Response{
+					Error: protobufErr(detailedErr),
+				}
+			})
 
-			acc, err := h.Accounts.Create(subctx, ins[i].RootXPubs, ins[i].Quorum, ins[i].Alias, ins[i].Tags, ins[i].ClientToken)
+			var tags map[string]interface{}
+			err := json.Unmarshal(req.Tags, &tags)
 			if err != nil {
-				responses[i] = err
+				detailedErr, _ := errInfo(err)
+				responses[i] = &pb.CreateAccountsResponse_Response{
+					Error: protobufErr(detailedErr),
+				}
+				return
+			}
+
+			acc, err := h.Accounts.Create(subctx, req.RootXpubs, int(req.Quorum), req.Alias, tags, req.ClientToken)
+			if err != nil {
+				detailedErr, _ := errInfo(err)
+				responses[i] = &pb.CreateAccountsResponse_Response{
+					Error: protobufErr(detailedErr),
+				}
 				return
 			}
 			path := signers.Path(acc.Signer, signers.AccountKeySpace)
-			var keys []accountKey
+			var keys []*pb.Account_Key
 			for _, xpub := range acc.XPubs {
-				keys = append(keys, accountKey{
-					RootXPub:              xpub,
-					AccountXPub:           xpub.Derive(path),
+				derived := xpub.Derive(path)
+				keys = append(keys, &pb.Account_Key{
+					RootXpub:              xpub[:],
+					AccountXpub:           derived[:],
 					AccountDerivationPath: path,
 				})
 			}
-			responses[i] = &accountResponse{
-				ID:     acc.ID,
-				Alias:  acc.Alias,
-				Keys:   keys,
-				Quorum: acc.Quorum,
-				Tags:   acc.Tags,
+			responses[i] = &pb.CreateAccountsResponse_Response{
+				Account: &pb.Account{
+					Id:     acc.ID,
+					Alias:  acc.Alias,
+					Keys:   keys,
+					Quorum: int32(acc.Quorum),
+					Tags:   req.Tags,
+				},
 			}
 		}(i)
 	}
 
 	wg.Wait()
-	return responses
+	return &pb.CreateAccountsResponse{
+		Responses: responses,
+	}, nil
 }

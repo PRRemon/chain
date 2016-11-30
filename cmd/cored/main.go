@@ -102,6 +102,10 @@ func init() {
 	expvar.NewString("runtime.GOOS").Set(runtime.GOOS)
 	expvar.NewString("runtime.GOARCH").Set(runtime.GOARCH)
 	expvar.NewString("runtime.Version").Set(runtime.Version())
+
+	config.Version = version
+	config.BuildCommit = buildCommit
+	config.BuildDate = buildDate
 }
 
 func main() {

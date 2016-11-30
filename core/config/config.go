@@ -16,7 +16,6 @@ import (
 	"chain/crypto/ed25519"
 	"chain/database/pg"
 	"chain/database/sql"
-	chainjson "chain/encoding/json"
 	"chain/errors"
 	"chain/log"
 	"chain/protocol"
@@ -34,27 +33,29 @@ var (
 	ErrBadSignerURL    = errors.New("block signer URL is invalid")
 	ErrBadSignerPubkey = errors.New("block signer pubkey is invalid")
 	ErrBadQuorum       = errors.New("quorum must be greater than 0 if there are signers")
+
+	Version, BuildCommit, BuildDate string
 )
 
 // Config encapsulates Core-level, persistent configuration options.
 type Config struct {
-	ID                   string  `json:"id"`
-	IsSigner             bool    `json:"is_signer"`
-	IsGenerator          bool    `json:"is_generator"`
-	BlockchainID         bc.Hash `json:"blockchain_id"`
-	GeneratorURL         string  `json:"generator_url"`
-	GeneratorAccessToken string  `json:"generator_access_token"`
+	ID                   string
+	IsSigner             bool
+	IsGenerator          bool
+	BlockchainID         bc.Hash
+	GeneratorURL         string
+	GeneratorAccessToken string
 	ConfiguredAt         time.Time
-	BlockPub             string        `json:"block_pub"`
-	Signers              []BlockSigner `json:"block_signer_urls"`
+	BlockPub             string
+	Signers              []BlockSigner
 	Quorum               int
 	MaxIssuanceWindow    time.Duration
 }
 
 type BlockSigner struct {
-	AccessToken string             `json:"access_token"`
-	Pubkey      chainjson.HexBytes `json:"pubkey"`
-	URL         string             `json:"url"`
+	AccessToken string
+	Pubkey      []byte
+	URL         string
 }
 
 // Load loads the stored configuration, if any, from the database.

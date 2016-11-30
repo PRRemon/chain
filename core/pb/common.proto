@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package pb;
+
+message Empty {
+
+}
+
+message ErrorResponse{
+  Error error = 9;
+}
+
+message Error {
+  string code = 1;
+  string message = 2;
+  string detail = 3;
+  bool temporary = 4;
+  bytes data = 5;
+}

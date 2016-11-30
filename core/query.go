@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"time"
 
+	"chain/core/pb"
 	"chain/core/query"
 	"chain/core/query/filter"
 	"chain/errors"
@@ -59,94 +61,339 @@ type (
 		AccountAlias interface{} `json:"account_alias,omitempty"`
 		AccountTags  interface{} `json:"account_tags"`
 	}
+	utxoResp struct {
+		Type            interface{} `json:"type"`
+		Purpose         interface{} `json:"purpose"`
+		TransactionID   interface{} `json:"transaction_id"`
+		Position        interface{} `json:"position"`
+		AssetID         interface{} `json:"asset_id"`
+		AssetAlias      interface{} `json:"asset_alias"`
+		AssetDefinition interface{} `json:"asset_definition"`
+		AssetTags       interface{} `json:"asset_tags"`
+		AssetIsLocal    interface{} `json:"asset_is_local"`
+		Amount          interface{} `json:"amount"`
+		AccountID       interface{} `json:"account_id"`
+		AccountAlias    interface{} `json:"account_alias"`
+		AccountTags     interface{} `json:"account_tags"`
+		ControlProgram  interface{} `json:"control_program"`
+		ReferenceData   interface{} `json:"reference_data"`
+		IsLocal         interface{} `json:"is_local"`
+	}
 )
 
-// listTransactions is an http handler for listing transactions matching
+func protoParams(params []*pb.FilterParam) []interface{} {
+	a := make([]interface{}, len(params))
+	for i, p := range params {
+		switch p.GetValue().(type) {
+		case *pb.FilterParam_String_:
+			a[i] = p.GetString_()
+		case *pb.FilterParam_Int64:
+			a[i] = p.GetInt64()
+		case *pb.FilterParam_Bytes:
+			a[i] = p.GetBytes()
+		case *pb.FilterParam_Bool:
+			a[i] = p.GetBool()
+		}
+	}
+	return a
+}
+
+// ListAccounts is an http handler for listing accounts matching
 // an index or an ad-hoc filter.
-//
-// POST /list-transactions
-func (h *Handler) listTransactions(ctx context.Context, in requestQuery) (result page, err error) {
-	var c context.CancelFunc
-	timeout := in.Timeout.Duration
+func (h *Handler) ListAccounts(ctx context.Context, in *pb.ListAccountsQuery) (*pb.ListAccountsResponse, error) {
+	limit := defGenericPageSize
+
+	// Build the filter predicate.
+	p, err := filter.Parse(in.Filter)
+	if err != nil {
+		return nil, errors.Wrap(err, "parsing acc query")
+	}
+	after := in.After
+
+	// Use the filter engine for querying account tags.
+	accounts, after, err := h.Indexer.Accounts(ctx, p, protoParams(in.FilterParams), after, limit)
+	if err != nil {
+		return nil, errors.Wrap(err, "running acc query")
+	}
+
+	result := make([]*accountResponse, 0, len(accounts))
+	for _, a := range accounts {
+		var orderedKeys []accountKey
+		keys, ok := a["keys"].([]interface{})
+		if ok {
+			for _, key := range keys {
+				mapKey, ok := key.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				orderedKeys = append(orderedKeys, accountKey{
+					RootXPub:              mapKey["root_xpub"],
+					AccountXPub:           mapKey["account_xpub"],
+					AccountDerivationPath: mapKey["account_derivation_path"],
+				})
+			}
+		}
+		r := &accountResponse{
+			ID:     a["id"],
+			Alias:  a["alias"],
+			Keys:   orderedKeys,
+			Quorum: a["quorum"],
+			Tags:   a["tags"],
+		}
+		result = append(result, r)
+	}
+
+	data, err := json.Marshal(httpjson.Array(result))
+	if err != nil {
+		return nil, errors.Wrap(err)
+	}
+
+	// Pull in the accounts by the IDs
+	out := in
+	out.After = after
+	return &pb.ListAccountsResponse{
+		Items:    data,
+		LastPage: len(result) < limit,
+		Next:     out,
+	}, nil
+}
+
+// ListAssets is an http handler for listing assets matching
+// an index or an ad-hoc filter.
+func (h *Handler) ListAssets(ctx context.Context, in *pb.ListAssetsQuery) (*pb.ListAssetsResponse, error) {
+	limit := defGenericPageSize
+
+	// Build the filter predicate.
+	p, err := filter.Parse(in.Filter)
+	if err != nil {
+		return nil, err
+	}
+	after := in.After
+
+	// Use the query engine for querying asset tags.
+	var assets []map[string]interface{}
+	assets, after, err = h.Indexer.Assets(ctx, p, protoParams(in.FilterParams), after, limit)
+	if err != nil {
+		return nil, errors.Wrap(err, "running asset query")
+	}
+
+	result := make([]*assetResponse, 0, len(assets))
+	for _, a := range assets {
+		var orderedKeys []assetKey
+		keys, ok := a["keys"].([]interface{})
+		if ok {
+			for _, key := range keys {
+				mapKey, ok := key.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				orderedKeys = append(orderedKeys, assetKey{
+					AssetPubkey:         mapKey["asset_pubkey"],
+					RootXPub:            mapKey["root_xpub"],
+					AssetDerivationPath: mapKey["asset_derivation_path"],
+				})
+			}
+		}
+		r := &assetResponse{
+			ID:              a["id"],
+			IssuanceProgram: a["issuance_program"],
+			Keys:            orderedKeys,
+			Quorum:          a["quorum"],
+			Definition:      a["definition"],
+			Tags:            a["tags"],
+			IsLocal:         a["is_local"],
+		}
+		if alias, ok := a["alias"].(string); ok && alias != "" {
+			r.Alias = &alias
+		}
+		result = append(result, r)
+	}
+
+	data, err := json.Marshal(httpjson.Array(result))
+	if err != nil {
+		return nil, errors.Wrap(err)
+	}
+
+	out := in
+	out.After = after
+	return &pb.ListAssetsResponse{
+		Items:    data,
+		LastPage: len(result) < limit,
+		Next:     out,
+	}, nil
+}
+
+func (h *Handler) ListBalances(ctx context.Context, in *pb.ListBalancesQuery) (*pb.ListBalancesResponse, error) {
+	var sumBy []filter.Field
+	p, err := filter.Parse(in.Filter)
+	if err != nil {
+		return nil, err
+	}
+
+	// Since an empty SumBy yields a meaningless result, we'll provide a
+	// sensible default here.
+	if len(in.SumBy) == 0 {
+		in.SumBy = []string{"asset_alias", "asset_id"}
+	}
+
+	for _, field := range in.SumBy {
+		f, err := filter.ParseField(field)
+		if err != nil {
+			return nil, err
+		}
+		sumBy = append(sumBy, f)
+	}
+
+	timestampMS := in.Timestamp
+	if timestampMS == 0 {
+		timestampMS = math.MaxInt64
+	} else if timestampMS > math.MaxInt64 {
+		return nil, errors.WithDetail(httpjson.ErrBadRequest, "timestamp is too large")
+	}
+
+	// TODO(jackson): paginate this endpoint.
+	balances, err := h.Indexer.Balances(ctx, p, protoParams(in.FilterParams), sumBy, timestampMS)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := json.Marshal(httpjson.Array(balances))
+	if err != nil {
+		return nil, errors.Wrap(err)
+	}
+
+	return &pb.ListBalancesResponse{
+		Items:    data,
+		LastPage: true,
+		Next:     in,
+	}, nil
+}
+
+// ListTxFeeds is an http handler for listing txfeeds. It does not take a filter.
+func (h *Handler) ListTxFeeds(ctx context.Context, in *pb.ListTxFeedsQuery) (*pb.ListTxFeedsResponse, error) {
+	limit := defGenericPageSize
+	after := in.After
+
+	txfeeds, after, err := h.Indexer.TxFeeds(ctx, after, limit)
+	if err != nil {
+		return nil, errors.Wrap(err, "running txfeed query")
+	}
+
+	var pbFeeds []*pb.TxFeed
+	for _, f := range txfeeds {
+		proto := &pb.TxFeed{
+			Id:     f.ID,
+			Filter: f.Filter,
+			After:  f.After,
+		}
+		if f.Alias != nil {
+			proto.Alias = *f.Alias
+		}
+		pbFeeds = append(pbFeeds, proto)
+	}
+
+	out := in
+	out.After = after
+	return &pb.ListTxFeedsResponse{
+		Items:    pbFeeds,
+		LastPage: len(txfeeds) < limit,
+		Next:     out,
+	}, nil
+}
+
+// ListTxs is an http handler for listing transactions matching
+// an index or an ad-hoc filter.
+func (h *Handler) ListTxs(ctx context.Context, in *pb.ListTxsQuery) (*pb.ListTxsResponse, error) {
+	var (
+		timeout time.Duration
+		err     error
+	)
+
+	if in.Timeout != "" {
+		timeout, err = time.ParseDuration(in.Timeout)
+	}
+	if err != nil {
+		return nil, errors.Wrap(err)
+	}
+
 	if timeout != 0 {
+		var c context.CancelFunc
 		ctx, c = context.WithTimeout(ctx, timeout)
 		defer c()
 	}
-	var (
-		p     filter.Predicate
-		after query.TxAfter
-	)
 
 	// Build the filter predicate.
-	p, err = filter.Parse(in.Filter)
+	p, err := filter.Parse(in.Filter)
 	if err != nil {
-		return result, err
+		return nil, err
 	}
 
-	endTimeMS := in.EndTimeMS
+	endTimeMS := in.EndTime
 	if endTimeMS == 0 {
 		endTimeMS = math.MaxInt64
 	} else if endTimeMS > math.MaxInt64 {
-		return result, errors.WithDetail(httpjson.ErrBadRequest, "end timestamp is too large")
+		return nil, errors.WithDetail(httpjson.ErrBadRequest, "end timestamp is too large")
 	}
+
+	var after query.TxAfter
 	// Either parse the provided `after` or look one up for the time range.
 	if in.After != "" {
 		after, err = query.DecodeTxAfter(in.After)
 		if err != nil {
-			return result, errors.Wrap(err, "decoding `after`")
+			return nil, errors.Wrap(err, "decoding `after`")
 		}
 	} else {
-		after, err = h.Indexer.LookupTxAfter(ctx, in.StartTimeMS, endTimeMS)
+		after, err = h.Indexer.LookupTxAfter(ctx, in.StartTime, endTimeMS)
 		if err != nil {
-			return result, err
+			return nil, err
 		}
 	}
 
 	limit := defGenericPageSize
-	txns, nextAfter, err := h.Indexer.Transactions(ctx, p, in.FilterParams, after, limit, in.AscLongPoll)
+	txns, nextAfter, err := h.Indexer.Transactions(ctx, p, protoParams(in.FilterParams), after, limit, in.AscendingWithLongPoll)
 	if err != nil {
-		return result, errors.Wrap(err, "running tx query")
+		return nil, errors.Wrap(err, "running tx query")
 	}
 
 	resp := make([]*txResp, 0, len(txns))
 	for _, t := range txns {
 		tjson, ok := t.(*json.RawMessage)
 		if !ok {
-			return result, fmt.Errorf("unexpected type %T in Indexer.Transactions output", t)
+			return nil, fmt.Errorf("unexpected type %T in Indexer.Transactions output", t)
 		}
 		if tjson == nil {
-			return result, fmt.Errorf("unexpected nil in Indexer.Transactions output")
+			return nil, fmt.Errorf("unexpected nil in Indexer.Transactions output")
 		}
 		var tx map[string]interface{}
 		err = json.Unmarshal(*tjson, &tx)
 		if err != nil {
-			return result, errors.Wrap(err, "decoding Indexer.Transactions output")
+			return nil, errors.Wrap(err, "decoding Indexer.Transactions output")
 		}
 
 		inp, ok := tx["inputs"].([]interface{})
 		if !ok {
-			return result, fmt.Errorf("unexpected type %T for inputs in Indexer.Transactions output", tx["inputs"])
+			return nil, fmt.Errorf("unexpected type %T for inputs in Indexer.Transactions output", tx["inputs"])
 		}
 
 		var inputs []map[string]interface{}
 		for i, in := range inp {
 			input, ok := in.(map[string]interface{})
 			if !ok {
-				return result, fmt.Errorf("unexpected type %T for input %d in Indexer.Transactions output", in, i)
+				return nil, fmt.Errorf("unexpected type %T for input %d in Indexer.Transactions output", in, i)
 			}
 			inputs = append(inputs, input)
 		}
 
 		outp, ok := tx["outputs"].([]interface{})
 		if !ok {
-			return result, fmt.Errorf("unexpected type %T for outputs in Indexer.Transactions output", tx["outputs"])
+			return nil, fmt.Errorf("unexpected type %T for outputs in Indexer.Transactions output", tx["outputs"])
 		}
 
 		var outputs []map[string]interface{}
 		for i, out := range outp {
 			output, ok := out.(map[string]interface{})
 			if !ok {
-				return result, fmt.Errorf("unexpected type %T for output %d in Indexer.Transactions output", out, i)
+				return nil, fmt.Errorf("unexpected type %T for output %d in Indexer.Transactions output", out, i)
 			}
 			outputs = append(outputs, output)
 		}
@@ -202,175 +449,59 @@ func (h *Handler) listTransactions(ctx context.Context, in requestQuery) (result
 		resp = append(resp, r)
 	}
 
+	data, err := json.Marshal(httpjson.Array(resp))
+	if err != nil {
+		return nil, errors.Wrap(err)
+	}
+
 	out := in
 	out.After = nextAfter.String()
-	return page{
-		Items:    httpjson.Array(resp),
+	return &pb.ListTxsResponse{
+		Items:    data,
 		LastPage: len(resp) < limit,
 		Next:     out,
 	}, nil
 }
 
-// listAccounts is an http handler for listing accounts matching
-// an index or an ad-hoc filter.
-//
-// POST /list-accounts
-func (h *Handler) listAccounts(ctx context.Context, in requestQuery) (page, error) {
-	limit := defGenericPageSize
-
-	// Build the filter predicate.
+func (h *Handler) ListUnspentOutputs(ctx context.Context, in *pb.ListUnspentOutputsQuery) (*pb.ListUnspentOutputsResponse, error) {
 	p, err := filter.Parse(in.Filter)
 	if err != nil {
-		return page{}, errors.Wrap(err, "parsing acc query")
-	}
-	after := in.After
-
-	// Use the filter engine for querying account tags.
-	accounts, after, err := h.Indexer.Accounts(ctx, p, in.FilterParams, after, limit)
-	if err != nil {
-		return page{}, errors.Wrap(err, "running acc query")
-	}
-
-	result := make([]*accountResponse, 0, len(accounts))
-	for _, a := range accounts {
-		var orderedKeys []accountKey
-		keys, ok := a["keys"].([]interface{})
-		if ok {
-			for _, key := range keys {
-				mapKey, ok := key.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				orderedKeys = append(orderedKeys, accountKey{
-					RootXPub:              mapKey["root_xpub"],
-					AccountXPub:           mapKey["account_xpub"],
-					AccountDerivationPath: mapKey["account_derivation_path"],
-				})
-			}
-		}
-		r := &accountResponse{
-			ID:     a["id"],
-			Alias:  a["alias"],
-			Keys:   orderedKeys,
-			Quorum: a["quorum"],
-			Tags:   a["tags"],
-		}
-		result = append(result, r)
-	}
-
-	// Pull in the accounts by the IDs
-	out := in
-	out.After = after
-	return page{
-		Items:    httpjson.Array(result),
-		LastPage: len(result) < limit,
-		Next:     out,
-	}, nil
-}
-
-// POST /list-balances
-func (h *Handler) listBalances(ctx context.Context, in requestQuery) (result page, err error) {
-	var p filter.Predicate
-	var sumBy []filter.Field
-	p, err = filter.Parse(in.Filter)
-	if err != nil {
-		return result, err
-	}
-
-	// Since an empty SumBy yields a meaningless result, we'll provide a
-	// sensible default here.
-	if len(in.SumBy) == 0 {
-		in.SumBy = []string{"asset_alias", "asset_id"}
-	}
-
-	for _, field := range in.SumBy {
-		f, err := filter.ParseField(field)
-		if err != nil {
-			return result, err
-		}
-		sumBy = append(sumBy, f)
-	}
-
-	timestampMS := in.TimestampMS
-	if timestampMS == 0 {
-		timestampMS = math.MaxInt64
-	} else if timestampMS > math.MaxInt64 {
-		return result, errors.WithDetail(httpjson.ErrBadRequest, "timestamp is too large")
-	}
-
-	// TODO(jackson): paginate this endpoint.
-	balances, err := h.Indexer.Balances(ctx, p, in.FilterParams, sumBy, timestampMS)
-	if err != nil {
-		return result, err
-	}
-
-	result.Items = httpjson.Array(balances)
-	result.LastPage = true
-	result.Next = in
-	return result, nil
-}
-
-// This type enforces the ordering of JSON fields in API output.
-type utxoResp struct {
-	Type            interface{} `json:"type"`
-	Purpose         interface{} `json:"purpose"`
-	TransactionID   interface{} `json:"transaction_id"`
-	Position        interface{} `json:"position"`
-	AssetID         interface{} `json:"asset_id"`
-	AssetAlias      interface{} `json:"asset_alias"`
-	AssetDefinition interface{} `json:"asset_definition"`
-	AssetTags       interface{} `json:"asset_tags"`
-	AssetIsLocal    interface{} `json:"asset_is_local"`
-	Amount          interface{} `json:"amount"`
-	AccountID       interface{} `json:"account_id"`
-	AccountAlias    interface{} `json:"account_alias"`
-	AccountTags     interface{} `json:"account_tags"`
-	ControlProgram  interface{} `json:"control_program"`
-	ReferenceData   interface{} `json:"reference_data"`
-	IsLocal         interface{} `json:"is_local"`
-}
-
-// POST /list-unspent-outputs
-func (h *Handler) listUnspentOutputs(ctx context.Context, in requestQuery) (result page, err error) {
-	var p filter.Predicate
-	p, err = filter.Parse(in.Filter)
-	if err != nil {
-		return result, err
+		return nil, err
 	}
 
 	var after *query.OutputsAfter
 	if in.After != "" {
 		after, err = query.DecodeOutputsAfter(in.After)
 		if err != nil {
-			return result, errors.Wrap(err, "decoding `after`")
+			return nil, errors.Wrap(err, "decoding `after`")
 		}
 	}
 
-	timestampMS := in.TimestampMS
+	timestampMS := in.Timestamp
 	if timestampMS == 0 {
 		timestampMS = math.MaxInt64
 	} else if timestampMS > math.MaxInt64 {
-		return result, errors.WithDetail(httpjson.ErrBadRequest, "timestamp is too large")
+		return nil, errors.WithDetail(httpjson.ErrBadRequest, "timestamp is too large")
 	}
 	limit := defGenericPageSize
-	outputs, nextAfter, err := h.Indexer.Outputs(ctx, p, in.FilterParams, timestampMS, after, limit)
+	outputs, nextAfter, err := h.Indexer.Outputs(ctx, p, protoParams(in.FilterParams), timestampMS, after, limit)
 	if err != nil {
-		return result, errors.Wrap(err, "querying outputs")
+		return nil, errors.Wrap(err, "querying outputs")
 	}
 
 	resp := make([]*utxoResp, 0, len(outputs))
 	for _, o := range outputs {
 		ojson, ok := o.(*json.RawMessage)
 		if !ok {
-			return result, fmt.Errorf("unexpected type %T in Indexer.Outputs output", o)
+			return nil, fmt.Errorf("unexpected type %T in Indexer.Outputs output", o)
 		}
 		if ojson == nil {
-			return result, fmt.Errorf("unexpected nil in Indexer.Outputs output")
+			return nil, fmt.Errorf("unexpected nil in Indexer.Outputs output")
 		}
 		var out map[string]interface{}
 		err = json.Unmarshal(*ojson, &out)
 		if err != nil {
-			return result, errors.Wrap(err, "decoding Indexer.Outputs output")
+			return nil, errors.Wrap(err, "decoding Indexer.Outputs output")
 		}
 		r := &utxoResp{
 			Type:            out["type"],
@@ -393,74 +524,17 @@ func (h *Handler) listUnspentOutputs(ctx context.Context, in requestQuery) (resu
 		resp = append(resp, r)
 	}
 
+	data, err := json.Marshal(httpjson.Array(resp))
+	if err != nil {
+		return nil, errors.Wrap(err)
+	}
+
 	outQuery := in
 	outQuery.After = nextAfter.String()
-	return page{
-		Items:    resp,
+	return &pb.ListUnspentOutputsResponse{
+		Items:    data,
 		LastPage: len(resp) < limit,
 		Next:     outQuery,
-	}, nil
-}
-
-// listAssets is an http handler for listing assets matching
-// an index or an ad-hoc filter.
-//
-// POST /list-assets
-func (h *Handler) listAssets(ctx context.Context, in requestQuery) (page, error) {
-	limit := defGenericPageSize
-
-	// Build the filter predicate.
-	p, err := filter.Parse(in.Filter)
-	if err != nil {
-		return page{}, err
-	}
-	after := in.After
-
-	// Use the query engine for querying asset tags.
-	var assets []map[string]interface{}
-	assets, after, err = h.Indexer.Assets(ctx, p, in.FilterParams, after, limit)
-	if err != nil {
-		return page{}, errors.Wrap(err, "running asset query")
-	}
-
-	result := make([]*assetResponse, 0, len(assets))
-	for _, a := range assets {
-		var orderedKeys []assetKey
-		keys, ok := a["keys"].([]interface{})
-		if ok {
-			for _, key := range keys {
-				mapKey, ok := key.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				orderedKeys = append(orderedKeys, assetKey{
-					AssetPubkey:         mapKey["asset_pubkey"],
-					RootXPub:            mapKey["root_xpub"],
-					AssetDerivationPath: mapKey["asset_derivation_path"],
-				})
-			}
-		}
-		r := &assetResponse{
-			ID:              a["id"],
-			IssuanceProgram: a["issuance_program"],
-			Keys:            orderedKeys,
-			Quorum:          a["quorum"],
-			Definition:      a["definition"],
-			Tags:            a["tags"],
-			IsLocal:         a["is_local"],
-		}
-		if alias, ok := a["alias"].(string); ok && alias != "" {
-			r.Alias = &alias
-		}
-		result = append(result, r)
-	}
-
-	out := in
-	out.After = after
-	return page{
-		Items:    httpjson.Array(result),
-		LastPage: len(result) < limit,
-		Next:     out,
 	}, nil
 }
 
@@ -473,25 +547,4 @@ func txAccountFromMap(m map[string]interface{}) *txAccount {
 		AccountAlias: m["account_alias"],
 		AccountTags:  m["account_tags"],
 	}
-}
-
-// listTxFeeds is an http handler for listing txfeeds. It does not take a filter.
-//
-// POST /list-transaction-feeds
-func (h *Handler) listTxFeeds(ctx context.Context, in requestQuery) (page, error) {
-	limit := defGenericPageSize
-	after := in.After
-
-	txfeeds, after, err := h.Indexer.TxFeeds(ctx, after, limit)
-	if err != nil {
-		return page{}, errors.Wrap(err, "running txfeed query")
-	}
-
-	out := in
-	out.After = after
-	return page{
-		Items:    httpjson.Array(txfeeds),
-		LastPage: len(txfeeds) < limit,
-		Next:     out,
-	}, nil
 }

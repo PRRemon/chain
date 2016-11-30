@@ -3,12 +3,12 @@ package core
 
 import (
 	"context"
-	"expvar"
 	"fmt"
 	"net/http"
-	"net/http/pprof"
 	"sync"
 	"time"
+
+	"google.golang.org/grpc"
 
 	"chain/core/accesstoken"
 	"chain/core/account"
@@ -23,7 +23,6 @@ import (
 	"chain/core/txdb"
 	"chain/core/txfeed"
 	"chain/database/pg"
-	"chain/encoding/json"
 	"chain/errors"
 	"chain/generated/dashboard"
 	"chain/generated/docs"
@@ -94,72 +93,8 @@ func maxBytes(h http.Handler) http.Handler {
 }
 
 func (h *Handler) init() {
-	// Setup the available transact actions.
-	h.actionDecoders = map[string]func(data []byte) (txbuilder.Action, error){
-		"control_account":                h.Accounts.DecodeControlAction,
-		"control_program":                txbuilder.DecodeControlProgramAction,
-		"issue":                          h.Assets.DecodeIssueAction,
-		"spend_account":                  h.Accounts.DecodeSpendAction,
-		"spend_account_unspent_output":   h.Accounts.DecodeSpendUTXOAction,
-		"set_transaction_reference_data": txbuilder.DecodeSetTxRefDataAction,
-	}
-
-	// Setup the muxer.
-	needConfig := jsonHandler
-	if h.Config == nil {
-		needConfig = func(f interface{}) http.Handler {
-			return alwaysError(errUnconfigured)
-		}
-	}
-
 	m := http.NewServeMux()
 	m.Handle("/", alwaysError(errNotFound))
-
-	m.Handle("/create-account", needConfig(h.createAccount))
-	m.Handle("/create-asset", needConfig(h.createAsset))
-	m.Handle("/build-transaction", needConfig(h.build))
-	m.Handle("/submit-transaction", needConfig(h.submit))
-	m.Handle("/create-control-program", needConfig(h.createControlProgram))
-	m.Handle("/create-transaction-feed", needConfig(h.createTxFeed))
-	m.Handle("/get-transaction-feed", needConfig(h.getTxFeed))
-	m.Handle("/update-transaction-feed", needConfig(h.updateTxFeed))
-	m.Handle("/delete-transaction-feed", needConfig(h.deleteTxFeed))
-	m.Handle("/mockhsm/create-key", needConfig(h.mockhsmCreateKey))
-	m.Handle("/mockhsm/list-keys", needConfig(h.mockhsmListKeys))
-	m.Handle("/mockhsm/delkey", needConfig(h.mockhsmDelKey))
-	m.Handle("/mockhsm/sign-transaction", needConfig(h.mockhsmSignTemplates))
-	m.Handle("/list-accounts", needConfig(h.listAccounts))
-	m.Handle("/list-assets", needConfig(h.listAssets))
-	m.Handle("/list-transaction-feeds", needConfig(h.listTxFeeds))
-	m.Handle("/list-transactions", needConfig(h.listTransactions))
-	m.Handle("/list-balances", needConfig(h.listBalances))
-	m.Handle("/list-unspent-outputs", needConfig(h.listUnspentOutputs))
-	m.Handle("/reset", needConfig(h.reset))
-
-	m.Handle(networkRPCPrefix+"submit", needConfig(h.Chain.AddTx))
-	m.Handle(networkRPCPrefix+"get-blocks", needConfig(h.getBlocksRPC)) // DEPRECATED: use get-block instead
-	m.Handle(networkRPCPrefix+"get-block", needConfig(h.getBlockRPC))
-	m.Handle(networkRPCPrefix+"get-snapshot-info", needConfig(h.getSnapshotInfoRPC))
-	m.Handle(networkRPCPrefix+"get-snapshot", http.HandlerFunc(h.getSnapshotRPC))
-	m.Handle(networkRPCPrefix+"signer/sign-block", needConfig(h.leaderSignHandler(h.Signer)))
-	m.Handle(networkRPCPrefix+"block-height", needConfig(func(ctx context.Context) map[string]uint64 {
-		h := h.Chain.Height()
-		return map[string]uint64{
-			"block_height": h,
-		}
-	}))
-
-	m.Handle("/create-access-token", jsonHandler(h.createAccessToken))
-	m.Handle("/list-access-tokens", jsonHandler(h.listAccessTokens))
-	m.Handle("/delete-access-token", jsonHandler(h.deleteAccessToken))
-	m.Handle("/configure", jsonHandler(h.configure))
-	m.Handle("/info", jsonHandler(h.info))
-
-	m.Handle("/debug/vars", http.HandlerFunc(expvarHandler))
-	m.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
-	m.Handle("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
-	m.Handle("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
-	m.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
 
 	latencyHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if l := latency(m, req); l != nil {
@@ -190,46 +125,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.once.Do(h.init)
 
 	h.handler.ServeHTTP(w, r)
-}
-
-// Used as a request object for api queries
-type requestQuery struct {
-	Filter       string        `json:"filter,omitempty"`
-	FilterParams []interface{} `json:"filter_params,omitempty"`
-	SumBy        []string      `json:"sum_by,omitempty"`
-	PageSize     int           `json:"page_size"`
-
-	// AscLongPoll and Timeout are used by /list-transactions
-	// to facilitate notifications.
-	AscLongPoll bool          `json:"ascending_with_long_poll,omitempty"`
-	Timeout     json.Duration `json:"timeout"`
-
-	// After is a completely opaque cursor, indicating that only
-	// items in the result set after the one identified by `After`
-	// should be included. It has no relationship to time.
-	After string `json:"after"`
-
-	// These two are used for time-range queries like /list-transactions
-	StartTimeMS uint64 `json:"start_time,omitempty"`
-	EndTimeMS   uint64 `json:"end_time,omitempty"`
-
-	// This is used for point-in-time queries like /list-balances
-	// TODO(bobg): Different request structs for endpoints with different needs
-	TimestampMS uint64 `json:"timestamp,omitempty"`
-
-	// This is used for filtering results from /list-access-tokens
-	// Value must be "client" or "network"
-	Type string `json:"type"`
-
-	// Aliases is used to filter results from /mockshm/list-keys
-	Aliases []string `json:"aliases,omitempty"`
-}
-
-// Used as a response object for api queries
-type page struct {
-	Items    interface{}  `json:"items"`
-	Next     requestQuery `json:"next"`
-	LastPage bool         `json:"last_page"`
 }
 
 // timeoutContextHandler propagates the timeout, if any, provided as a header
@@ -285,6 +180,25 @@ func (h *Handler) leaderSignHandler(f func(context.Context, *bc.Block) ([]byte, 
 	}
 }
 
+func leaderConn(ctx context.Context, db pg.DB, self string) (*grpc.ClientConn, error) {
+	addr, err := leader.Address(ctx, db)
+	if err != nil {
+		return nil, errors.Wrap(err)
+	}
+	// Don't infinite loop if the leader's address is our own address.
+	// This is possible if we just became the leader. The client should
+	// just retry.
+	if addr == self {
+		return nil, errLeaderElection
+	}
+
+	conn, err := rpc.NewGRPCConn(addr, "")
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
 // forwardToLeader forwards the current request to the core's leader
 // process. It propagates the same credentials used in the current
 // request. For that reason, it cannot be used outside of a request-
@@ -319,23 +233,6 @@ func (h *Handler) forwardToLeader(ctx context.Context, path string, body interfa
 	}
 
 	return l.Call(ctx, path, body, &resp)
-}
-
-// expvarHandler is copied from the expvar package.
-// TODO(jackson): In Go 1.8, use expvar.Handler.
-// https://go-review.googlesource.com/#/c/24722/
-func expvarHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	fmt.Fprintf(w, "{\n")
-	first := true
-	expvar.Do(func(kv expvar.KeyValue) {
-		if !first {
-			fmt.Fprintf(w, ",\n")
-		}
-		first = false
-		fmt.Fprintf(w, "%q: %s", kv.Key, kv.Value)
-	})
-	fmt.Fprintf(w, "\n}\n")
 }
 
 func healthHandler(handler http.Handler) http.Handler {

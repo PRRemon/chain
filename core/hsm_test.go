@@ -9,6 +9,7 @@ import (
 	"chain/core/asset"
 	"chain/core/coretest"
 	"chain/core/mockhsm"
+	"chain/core/pb"
 	"chain/core/pin"
 	"chain/core/query"
 	"chain/core/txbuilder"
@@ -35,7 +36,7 @@ func TestMockHSM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	acct1, err := accounts.Create(ctx, []string{xpub1.XPub.String()}, 1, "", nil, nil)
+	acct1, err := accounts.Create(ctx, []string{xpub1.XPub.String()}, 1, "", nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +45,7 @@ func TestMockHSM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	acct2, err := accounts.Create(ctx, []string{xpub2.String()}, 1, "", nil, nil)
+	acct2, err := accounts.Create(ctx, []string{xpub2.String()}, 1, "", nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +65,13 @@ func TestMockHSM(t *testing.T) {
 		t.Fatal(err)
 	}
 	coretest.SignTxTemplate(t, ctx, tmpl, &testutil.TestXPrv)
-	err = txbuilder.FinalizeTx(ctx, c, bc.NewTx(*tmpl.Transaction))
+
+	txdata, err := bc.NewTxDataFromBytes(tmpl.RawTransaction)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = txbuilder.FinalizeTx(ctx, c, bc.NewTx(*txdata))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,17 +90,14 @@ func TestMockHSM(t *testing.T) {
 	}
 
 	h := &Handler{HSM: mockhsm}
-	outTmpls := h.mockhsmSignTemplates(ctx, struct {
-		Txs   []*txbuilder.Template `json:"transactions"`
-		XPubs []string              `json:"xpubs"`
-	}{[]*txbuilder.Template{tmpl}, []string{xpub1.XPub.String()}})
-	if len(outTmpls) != 1 {
-		t.Fatalf("expected 1 output template, got %d", len(outTmpls))
+	outTmpls, _ := h.SignTxs(ctx, &pb.SignTxsRequest{
+		Transactions: []*pb.TxTemplate{tmpl},
+		Xpubs:        []string{xpub1.XPub.String()},
+	})
+	if len(outTmpls.Responses) != 1 {
+		t.Fatalf("expected 1 output template, got %d", len(outTmpls.Responses))
 	}
-	outTmpl, ok := outTmpls[0].(*txbuilder.Template)
-	if !ok {
-		t.Fatalf("expected a *txbuilder.Template, got %T (%v)", outTmpls[0], outTmpls[0])
-	}
+	outTmpl := outTmpls.Responses[0].Template
 	if len(outTmpl.SigningInstructions) != 2 {
 		t.Fatalf("expected 2 signing instructions, got %d", len(outTmpl.SigningInstructions))
 	}
@@ -102,24 +106,25 @@ func TestMockHSM(t *testing.T) {
 	inspectSigInst(t, outTmpl.SigningInstructions[1], false)
 }
 
-func inspectSigInst(t *testing.T, si *txbuilder.SigningInstruction, expectSig bool) {
+func inspectSigInst(t *testing.T, si *pb.TxTemplate_SigningInstruction, expectSig bool) {
 	if len(si.WitnessComponents) != 1 {
 		t.Fatalf("len(si.WitnessComponents) is %d, want 1", len(si.WitnessComponents))
 	}
-	s, ok := si.WitnessComponents[0].(*txbuilder.SignatureWitness)
+	_, ok := si.WitnessComponents[0].Component.(*pb.TxTemplate_WitnessComponent_Signature)
 	if !ok {
-		t.Fatalf("si.WitnessComponents[0] has type %T, want *txbuilder.SignatureWitness", si.WitnessComponents[0])
+		t.Fatalf("si.WitnessComponents[0] has type %T, want *pb.TxTemplate_WitnessComponent_Signature", si.WitnessComponents[0].Component)
 	}
-	if len(s.Sigs) != 1 {
-		t.Fatalf("len(s.Sigs) is %d, want 1", len(s.Sigs))
+	s := si.WitnessComponents[0].GetSignature()
+	if len(s.Signatures) != 1 {
+		t.Fatalf("len(s.Sigs) is %d, want 1", len(s.Signatures))
 	}
 	if expectSig {
-		if len(s.Sigs[0]) == 0 {
+		if len(s.Signatures[0]) == 0 {
 			t.Errorf("expected a signature in s.Sigs[0]")
 		}
 	} else {
-		if len(s.Sigs[0]) != 0 {
-			t.Errorf("expected no signature in s.Sigs[0], got %x", s.Sigs[0])
+		if len(s.Signatures[0]) != 0 {
+			t.Errorf("expected no signature in s.Sigs[0], got %x", s.Signatures[0])
 		}
 	}
 }

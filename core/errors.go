@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 
 	"chain/core/accesstoken"
 	"chain/core/account"
@@ -9,6 +10,7 @@ import (
 	"chain/core/blocksigner"
 	"chain/core/config"
 	"chain/core/mockhsm"
+	"chain/core/pb"
 	"chain/core/query"
 	"chain/core/query/filter"
 	"chain/core/rpc"
@@ -83,13 +85,14 @@ var (
 		errUnconfigured:                errorInfo{400, "CH100", "This core still needs to be configured"},
 		errAlreadyConfigured:           errorInfo{400, "CH101", "This core has already been configured"},
 		config.ErrBadGenerator:         errorInfo{400, "CH102", "Generator URL returned an invalid response"},
-		errBadBlockPub:                 errorInfo{400, "CH103", "Provided Block XPub is invalid"},
 		rpc.ErrWrongNetwork:            errorInfo{502, "CH104", "A peer core is operating on a different blockchain network"},
 		protocol.ErrTheDistantFuture:   errorInfo{400, "CH105", "Requested height is too far ahead"},
 		config.ErrBadSignerURL:         errorInfo{400, "CH106", "Block signer URL is invalid"},
 		config.ErrBadSignerPubkey:      errorInfo{400, "CH107", "Block signer pubkey is invalid"},
 		config.ErrBadQuorum:            errorInfo{400, "CH108", "Quorum must be greater than 0 if there are signers"},
+		errBadIssuanceWindow:           errorInfo{400, "CH109", "Max issuance window is not in a valid format"},
 		errProdReset:                   errorInfo{400, "CH110", "Reset can only be called in a development system"},
+		errBadBlockchainID:             errorInfo{400, "CH111", "Blockchain ID length is invalid"},
 		errNoClientTokens:              errorInfo{400, "CH120", "Cannot enable client authentication with no client tokens"},
 		blocksigner.ErrConsensusChange: errorInfo{400, "CH150", "Refuse to sign block with consensus change"},
 
@@ -176,4 +179,19 @@ func errInfoBodyList(errs []error) (a []detailedError) {
 		a = append(a, body)
 	}
 	return a
+}
+
+func protobufErr(err detailedError) *pb.Error {
+	var data []byte
+
+	if len(err.Data) > 0 {
+		data, _ = json.Marshal(err.Data)
+	}
+	return &pb.Error{
+		Code:      err.ChainCode,
+		Message:   err.Message,
+		Detail:    err.Detail,
+		Data:      data,
+		Temporary: err.Temporary,
+	}
 }

@@ -1,6 +1,7 @@
 package txbuilder_test
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -8,6 +9,7 @@ import (
 	"chain/core/account"
 	"chain/core/asset"
 	"chain/core/coretest"
+	"chain/core/pb"
 	"chain/core/pin"
 	"chain/core/query"
 	. "chain/core/txbuilder"
@@ -56,9 +58,15 @@ func TestSighashCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tpl1.AllowAdditional = true
+	tpl1.AllowAdditionalActions = true
 	coretest.SignTxTemplate(t, ctx, tpl1, &info.privKeyAccounts)
-	err = CheckTxSighashCommitment(bc.NewTx(*tpl1.Transaction))
+
+	txdata1, err := bc.NewTxDataFromBytes(tpl1.RawTransaction)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = CheckTxSighashCommitment(bc.NewTx(*txdata1))
 	if err == nil {
 		t.Error("unexpected success from checkTxSighashCommitment")
 	}
@@ -66,23 +74,32 @@ func TestSighashCheck(t *testing.T) {
 	spendAction2a := info.NewSpendAction(assetAmount, info.acctB.ID, nil, nil)
 	controlAction2 := info.NewControlAction(assetAmount, info.acctA.ID, nil)
 
-	tpl2a, err := Build(ctx, tpl1.Transaction, []Action{spendAction2a, controlAction2}, time.Now().Add(time.Minute))
+	tpl2a, err := Build(ctx, txdata1, []Action{spendAction2a, controlAction2}, time.Now().Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
 	coretest.SignTxTemplate(t, ctx, tpl2a, &info.privKeyAccounts)
-	err = CheckTxSighashCommitment(bc.NewTx(*tpl2a.Transaction))
+
+	txdata2a, err := bc.NewTxDataFromBytes(tpl2a.RawTransaction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = CheckTxSighashCommitment(bc.NewTx(*txdata2a))
 	if err != nil {
 		t.Errorf("unexpected failure from checkTxSighashCommitment (case 1): %v", err)
 	}
 
 	issueAction2b := info.NewIssueAction(assetAmount, nil)
-	tpl2b, err := Build(ctx, tpl1.Transaction, []Action{issueAction2b, controlAction2}, time.Now().Add(time.Minute))
+	tpl2b, err := Build(ctx, txdata1, []Action{issueAction2b, controlAction2}, time.Now().Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
 	coretest.SignTxTemplate(t, ctx, tpl2b, &info.privKeyAsset)
-	err = CheckTxSighashCommitment(bc.NewTx(*tpl2b.Transaction))
+	txdata2b, err := bc.NewTxDataFromBytes(tpl2a.RawTransaction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = CheckTxSighashCommitment(bc.NewTx(*txdata2b))
 	if err != nil {
 		t.Errorf("unexpected failure from checkTxSighashCommitment (case 2): %v", err)
 	}
@@ -125,10 +142,24 @@ func TestConflictingTxsInPool(t *testing.T) {
 	if err != nil {
 		testutil.FatalErr(t, err)
 	}
-	unsignedTx := *firstTemplate.Transaction
+	unsignedTx, err := bc.NewTxDataFromBytes(firstTemplate.RawTransaction)
+	if err != nil {
+		testutil.FatalErr(t, err)
+	}
 	coretest.SignTxTemplate(t, ctx, firstTemplate, &info.privKeyAccounts)
-	tx := bc.NewTx(*firstTemplate.Transaction)
+
+	signedTx, err := bc.NewTxDataFromBytes(firstTemplate.RawTransaction)
+	if err != nil {
+		testutil.FatalErr(t, err)
+	}
+	tx := bc.NewTx(*signedTx)
 	err = FinalizeTx(ctx, info.Chain, tx)
+	if err != nil {
+		testutil.FatalErr(t, err)
+	}
+
+	var buf bytes.Buffer
+	_, err = unsignedTx.WriteTo(&buf)
 	if err != nil {
 		testutil.FatalErr(t, err)
 	}
@@ -136,15 +167,16 @@ func TestConflictingTxsInPool(t *testing.T) {
 	// Slighly tweak the first tx so it has a different hash, but
 	// still consumes the same UTXOs.
 	unsignedTx.MaxTime++
-	secondTemplate := &Template{
-		Transaction:         &unsignedTx,
+	secondTemplate := &pb.TxTemplate{
+		RawTransaction:      buf.Bytes(),
 		SigningInstructions: firstTemplate.SigningInstructions,
 		Local:               true,
 	}
-	secondTemplate.SigningInstructions[0].WitnessComponents[0].(*SignatureWitness).Program = nil
-	secondTemplate.SigningInstructions[0].WitnessComponents[0].(*SignatureWitness).Sigs = nil
+	secondTemplate.SigningInstructions[0].WitnessComponents[0].GetSignature().Program = nil
+	secondTemplate.SigningInstructions[0].WitnessComponents[0].GetSignature().Signatures = nil
 	coretest.SignTxTemplate(t, ctx, secondTemplate, &info.privKeyAccounts)
-	err = FinalizeTx(ctx, info.Chain, bc.NewTx(*secondTemplate.Transaction))
+	signedTx2, err := bc.NewTxDataFromBytes(secondTemplate.RawTransaction)
+	err = FinalizeTx(ctx, info.Chain, bc.NewTx(*signedTx2))
 	if err != nil {
 		testutil.FatalErr(t, err)
 	}
@@ -332,11 +364,11 @@ func bootdb(ctx context.Context, db *sql.DB, t testing.TB) (*testInfo, error) {
 		return nil, err
 	}
 
-	acctA, err := accounts.Create(ctx, []string{accPub.String()}, 1, "", nil, nil)
+	acctA, err := accounts.Create(ctx, []string{accPub.String()}, 1, "", nil, "")
 	if err != nil {
 		return nil, err
 	}
-	acctB, err := accounts.Create(ctx, []string{accPub.String()}, 1, "", nil, nil)
+	acctB, err := accounts.Create(ctx, []string{accPub.String()}, 1, "", nil, "")
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +377,7 @@ func bootdb(ctx context.Context, db *sql.DB, t testing.TB) (*testInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	asset, err := assets.Define(ctx, []string{assetPub.String()}, 1, nil, "", nil, nil)
+	asset, err := assets.Define(ctx, []string{assetPub.String()}, 1, nil, "", nil, "")
 	if err != nil {
 		return nil, err
 	}
@@ -377,7 +409,13 @@ func issue(ctx context.Context, t testing.TB, info *testInfo, destAcctID string,
 		return nil, err
 	}
 	coretest.SignTxTemplate(t, ctx, issueTx, &info.privKeyAsset)
-	tx := bc.NewTx(*issueTx.Transaction)
+
+	txdata, err := bc.NewTxDataFromBytes(issueTx.RawTransaction)
+	if err != nil {
+		return nil, err
+	}
+
+	tx := bc.NewTx(*txdata)
 	return tx, FinalizeTx(ctx, info.Chain, tx)
 }
 
@@ -395,8 +433,12 @@ func transfer(ctx context.Context, t testing.TB, info *testInfo, srcAcctID, dest
 	}
 
 	coretest.SignTxTemplate(t, ctx, xferTx, &info.privKeyAccounts)
+	txdata, err := bc.NewTxDataFromBytes(xferTx.RawTransaction)
+	if err != nil {
+		return nil, err
+	}
 
-	tx := bc.NewTx(*xferTx.Transaction)
+	tx := bc.NewTx(*txdata)
 	err = FinalizeTx(ctx, info.Chain, tx)
 	return tx, errors.Wrap(err)
 }
